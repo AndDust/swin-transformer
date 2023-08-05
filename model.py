@@ -56,9 +56,16 @@ def window_partition(x, window_size: int):
         windows: (num_windows*B, window_size, window_size, C)
     """
     B, H, W, C = x.shape
+    """
+        x.shape : torch.Size([8, 8, 7, 8, 7, 96])
+    """
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
     # permute: [B, H//Mh, Mh, W//Mw, Mw, C] -> [B, H//Mh, W//Mh, Mw, Mw, C]
-    # view: [B, H//Mh, W//Mw, Mh, Mw, C] -> [B*num_windows, Mh, Mw, C]
+    # view: [B, H//Mh, W//Mw, Mh, Mw, C] -> [B*num_windows, Mh(窗口高度), Mw（窗口宽度）, C]
+    """
+        x.permute(0, 1, 3, 2, 4, 5).shape : torch.Size([8, 8, 8, 7, 7, 96])
+        windows.shape : torch.Size([64, 7, 7, 1])
+    """
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows
 
@@ -90,7 +97,7 @@ class PatchEmbed(nn.Module):
     """
     def __init__(self, patch_size=4, in_c=3, embed_dim=96, norm_layer=None):
         super().__init__()
-        patch_size = (patch_size, patch_size)
+        patch_size = (patch_size, patch_size) # (4, 4)
         self.patch_size = patch_size
         self.in_chans = in_c
         self.embed_dim = embed_dim
@@ -106,15 +113,30 @@ class PatchEmbed(nn.Module):
         if pad_input:
             # to pad the last 3 dimensions,
             # (W_left, W_right, H_top,H_bottom, C_front, C_back)
+            """
+                F.pad(x,pad) : 左右，上下，前后
+                这里是在宽度方向的右侧以及高度方向的底部进行padding
+            """
             x = F.pad(x, (0, self.patch_size[1] - W % self.patch_size[1],
                           0, self.patch_size[0] - H % self.patch_size[0],
                           0, 0))
 
         # 下采样patch_size倍
+        """
+            x.shape : torch.Size([8, 96, 56, 56])
+        """
         x = self.proj(x)
         _, _, H, W = x.shape
         # flatten: [B, C, H, W] -> [B, C, HW]
         # transpose: [B, C, HW] -> [B, HW, C]
+        """
+            在原图上对应3136个4*4的小块，每个小块96个通道
+            x.flatten(2).shape : torch.Size([8, 96, 3136])  
+            x.flatten(2).transpose(1, 2).shape : torch.Size([8, 3136, 96])
+            
+            对于第一个特征图来说，3136个像素，每个像素96个通道，包含了原始图片4个像素（每个像素3个通道）的信息。
+            所以一个像素点就是原始图片的4个像素的信息
+        """
         x = x.flatten(2).transpose(1, 2)
         x = self.norm(x)
         return x, H, W
@@ -130,7 +152,10 @@ class PatchMerging(nn.Module):
 
     def __init__(self, dim, norm_layer=nn.LayerNorm):
         super().__init__()
-        self.dim = dim
+        self.dim = dim # 96
+        """
+            通过linear将4C的通道数降低到2C
+        """
         self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
         self.norm = norm_layer(4 * dim)
 
@@ -168,6 +193,9 @@ class PatchMerging(nn.Module):
 class Mlp(nn.Module):
     """ MLP as used in Vision Transformer, MLP-Mixer and related networks
     """
+    """ 
+        in_features : 96
+    """
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
         out_features = out_features or in_features
@@ -179,10 +207,14 @@ class Mlp(nn.Module):
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop2 = nn.Dropout(drop)
 
+    # x.shape : torch.Size([8, 3136, 96])
     def forward(self, x):
+        # x.shape : torch.Size([8, 3136, 384])
         x = self.fc1(x)
+
         x = self.act(x)
         x = self.drop1(x)
+        # x.shape : torch.Size([8, 3136, 96])
         x = self.fc2(x)
         x = self.drop2(x)
         return x
@@ -217,7 +249,7 @@ class WindowAttention(nn.Module):
         # get pair-wise relative position index for each token inside the window
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing="ij"))  # [2, Mh, Mw]
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # [2, Mh, Mw]
         coords_flatten = torch.flatten(coords, 1)  # [2, Mh*Mw]
         # [2, Mh*Mw, 1] - [2, 1, Mh*Mw]
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # [2, Mh*Mw, Mh*Mw]
@@ -236,6 +268,9 @@ class WindowAttention(nn.Module):
         nn.init.trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
+    """
+        x.shape : torch.Size([512, 49, 96])
+    """
     def forward(self, x, mask: Optional[torch.Tensor] = None):
         """
         Args:
@@ -247,8 +282,19 @@ class WindowAttention(nn.Module):
         # qkv(): -> [batch_size*num_windows, Mh*Mw, 3 * total_embed_dim]
         # reshape: -> [batch_size*num_windows, Mh*Mw, 3, num_heads, embed_dim_per_head]
         # permute: -> [3, batch_size*num_windows, num_heads, Mh*Mw, embed_dim_per_head]
+
+        """
+            [3, batch_size*num_windows, num_heads, Mh*Mw, embed_dim_per_head]
+            qkv.shape : torch.Size([3, 512, 3, 49, 32])
+        """
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         # [batch_size*num_windows, num_heads, Mh*Mw, embed_dim_per_head]
+        """
+            [batch_size*num_windows, num_heads, Mh*Mw, embed_dim_per_head]
+            q.shape : torch.Size([512, 3, 49, 32])
+            k.shape : torch.Size([512, 3, 49, 32])
+            v.shape : torch.Size([512, 3, 49, 32])
+        """
         q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
 
         # transpose: -> [batch_size*num_windows, num_heads, embed_dim_per_head, Mh*Mw]
@@ -262,6 +308,10 @@ class WindowAttention(nn.Module):
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # [nH, Mh*Mw, Mh*Mw]
         attn = attn + relative_position_bias.unsqueeze(0)
 
+        """
+            当是SW-MSA时
+            mask.shape : torch.Size([64, 49, 49])
+        """
         if mask is not None:
             # mask: [nW, Mh*Mw, Mh*Mw]
             nW = mask.shape[0]  # num_windows
@@ -313,6 +363,8 @@ class SwinTransformerBlock(nn.Module):
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
+
+        # 这里的WindowAttention就是W-MSA或者SW-MSA
         self.attn = WindowAttention(
             dim, window_size=(self.window_size, self.window_size), num_heads=num_heads, qkv_bias=qkv_bias,
             attn_drop=attn_drop, proj_drop=drop)
@@ -322,13 +374,17 @@ class SwinTransformerBlock(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
+    """
+        x.shape : torch.Size([8, 3136, 96])
+    """
     def forward(self, x, attn_mask):
         H, W = self.H, self.W
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
 
-        shortcut = x
-        x = self.norm1(x)
+        shortcut = x # 保存原始输入
+        # x.shape : torch.Size([8, 3136, 96])
+        x = self.norm1(x) # normalized_shape = 96，在最后一个维度上做layer_norm
         x = x.view(B, H, W, C)
 
         # pad feature maps to multiples of window size
@@ -340,14 +396,20 @@ class SwinTransformerBlock(nn.Module):
         _, Hp, Wp, _ = x.shape
 
         # cyclic shift
-        if self.shift_size > 0:
+        if self.shift_size > 0: # 大于0，对应的是SW-MSA
             shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
-        else:
+        else: # 小于0，对应的是W-MSA
             shifted_x = x
             attn_mask = None
 
         # partition windows
+        """
+           x_windows.shape : torch.Size([512, 7, 7, 96])
+        """
         x_windows = window_partition(shifted_x, self.window_size)  # [nW*B, Mh, Mw, C]
+        """
+            x_windows.shape : torch.Size([512, 49, 96])
+        """
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # [nW*B, Mh*Mw, C]
 
         # W-MSA/SW-MSA
@@ -357,7 +419,7 @@ class SwinTransformerBlock(nn.Module):
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)  # [nW*B, Mh, Mw, C]
         shifted_x = window_reverse(attn_windows, self.window_size, Hp, Wp)  # [B, H', W', C]
 
-        # reverse cyclic shift
+        # reverse cyclic shift 还原数据
         if self.shift_size > 0:
             x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
@@ -375,7 +437,11 @@ class SwinTransformerBlock(nn.Module):
 
         return x
 
-
+"""
+    每个stage，即代码中的BasicLayer，由若干个block组成，而block的数目由depth列表中的元素决定，
+    每个block就是W-MSA（window-multihead self attention）或者SW-MSA（shift window multihead self attention），
+    一般有偶数个block，两种SA交替出现，比如6个block，0，2，4是W-MSA，1，3，5是SW-MSA。
+"""
 class BasicLayer(nn.Module):
     """
     A basic Swin Transformer layer for one stage.
@@ -399,11 +465,11 @@ class BasicLayer(nn.Module):
                  mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0.,
                  drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
         super().__init__()
-        self.dim = dim
-        self.depth = depth
-        self.window_size = window_size
+        self.dim = dim # 通道数
+        self.depth = depth # block的深度
+        self.window_size = window_size # 划分的window size
         self.use_checkpoint = use_checkpoint
-        self.shift_size = window_size // 2
+        self.shift_size = window_size // 2 # 整除（取模）
 
         # build blocks
         self.blocks = nn.ModuleList([
@@ -411,6 +477,7 @@ class BasicLayer(nn.Module):
                 dim=dim,
                 num_heads=num_heads,
                 window_size=window_size,
+                # 通过shift_size是否为0来判断是W-MSA还是SW-MSA
                 shift_size=0 if (i % 2 == 0) else self.shift_size,
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
@@ -426,6 +493,15 @@ class BasicLayer(nn.Module):
         else:
             self.downsample = None
 
+    """
+        x.shape : torch.Size([8, 3136, 96])
+        H : 56
+        W : 56
+        
+        self.window_size : 7
+        
+        对于尺寸一样的特征图来说，mask都是一样的
+    """
     def create_mask(self, x, H, W):
         # calculate attention mask for SW-MSA
         # 保证Hp和Wp是window_size的整数倍
@@ -444,15 +520,26 @@ class BasicLayer(nn.Module):
             for w in w_slices:
                 img_mask[:, h, w, :] = cnt
                 cnt += 1
-
-        mask_windows = window_partition(img_mask, self.window_size)  # [nW, Mh, Mw, 1]
+        """
+            mask_windows.shape : torch.Size([64, 7, 7, 1])
+        """
+        mask_windows = window_partition(img_mask, self.window_size) # [nW, Mh, Mw, 1]
+        """
+            mask_windows.shape : torch.Size([64, 49])
+        """
         mask_windows = mask_windows.view(-1, self.window_size * self.window_size)  # [nW, Mh*Mw]
+        """
+            attn_mask.shape : torch.Size([64, 49, 49])
+        """
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)  # [nW, 1, Mh*Mw] - [nW, Mh*Mw, 1]
         # [nW, Mh*Mw, Mh*Mw]
         attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
         return attn_mask
 
     def forward(self, x, H, W):
+        """
+            先创建一个mask,用于SW-MSA中，由于swin transformer block中不会改变特征图的大小，使用的多次SW-MSA都是一样的，所以mask也是一样的
+        """
         attn_mask = self.create_mask(x, H, W)  # [nW, Mh*Mw, Mh*Mw]
         for blk in self.blocks:
             blk.H, blk.W = H, W
@@ -466,9 +553,7 @@ class BasicLayer(nn.Module):
 
         return x, H, W
 
-
-class SwinTransformer(nn.Module):
-    r""" Swin Transformer
+    """ Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
           https://arxiv.org/pdf/2103.14030
 
@@ -477,18 +562,33 @@ class SwinTransformer(nn.Module):
         in_chans (int): Number of input image channels. Default: 3
         num_classes (int): Number of classes for classification head. Default: 1000
         embed_dim (int): Patch embedding dimension. Default: 96
-        depths (tuple(int)): Depth of each Swin Transformer layer.
+        
+        depths (tuple(int)): 重复swin transformer block的次数，对于swinT来说就是2 2 6 2，Depth of each Swin Transformer layer.
+        
         num_heads (tuple(int)): Number of attention heads in different layers.
-        window_size (int): Window size. Default: 7
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        
+        window_size (int): W-SMA以及SW-MSA中采用的window的大小。Window size. Default: 7
+        
+        mlp_ratio (float): MLP模块中，第一个全联接层将channel翻多少倍，Ratio of mlp hidden dim to embedding dim. Default: 4
+        
         qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        
         drop_rate (float): Dropout rate. Default: 0
+            第一个drop_rate除了在pos_drop中使用到，还在mlp以及其他地方使用到。
+            
         attn_drop_rate (float): Attention dropout rate. Default: 0
+            MSA中使用的
         drop_path_rate (float): Stochastic depth rate. Default: 0.1
+            Swin transformer block中使用的， 是递增的，从0慢慢增到0.1
+        
         norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        
         patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
     """
+class SwinTransformer(nn.Module):
+
 
     def __init__(self, patch_size=4, in_chans=3, num_classes=1000,
                  embed_dim=96, depths=(2, 2, 6, 2), num_heads=(3, 6, 12, 24),
@@ -499,8 +599,8 @@ class SwinTransformer(nn.Module):
         super().__init__()
 
         self.num_classes = num_classes
-        self.num_layers = len(depths)
-        self.embed_dim = embed_dim
+        self.num_layers = len(depths) ## 4
+        self.embed_dim = embed_dim  # 96
         self.patch_norm = patch_norm
         # stage4输出特征矩阵的channels
         self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
@@ -549,8 +649,14 @@ class SwinTransformer(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
+    """
+        x.shape : torch.Size([8, 3, 224, 224])
+    """
     def forward(self, x):
         # x: [B, L, C]
+        """
+            x.shape : torch.Size([8, 3136, 96])
+        """
         x, H, W = self.patch_embed(x)
         x = self.pos_drop(x)
 
